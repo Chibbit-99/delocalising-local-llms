@@ -59,6 +59,7 @@ jobs:
           from urllib.request import Request, urlopen
           from urllib.error import HTTPError, URLError
           import os
+          import threading
 
           ACTIVITY = "/tmp/ollama-last-request"
 
@@ -71,7 +72,12 @@ jobs:
               def do_HEAD(self): self.forward()
 
               def forward(self):
-                  open(ACTIVITY, "a").close()
+                  os.utime(ACTIVITY, None)
+                  finished = threading.Event()
+                  def heartbeat():
+                      while not finished.wait(20):
+                          os.utime(ACTIVITY, None)
+                  threading.Thread(target=heartbeat, daemon=True).start()
                   length = int(self.headers.get("Content-Length", "0"))
                   body = self.rfile.read(length) if length else None
                   headers = {
@@ -109,11 +115,15 @@ jobs:
                       self.send_header("Content-Length", str(len(data)))
                       self.end_headers()
                       self.wfile.write(data)
+                  finally:
+                      finished.set()
+                      os.utime(ACTIVITY, None)
 
               def log_message(self, fmt, *args):
                   print(fmt % args, flush=True)
 
           open(ACTIVITY, "a").close()
+          os.utime(ACTIVITY, None)
           ThreadingHTTPServer(("127.0.0.1", 8000), Proxy).serve_forever()
           PY
           python /tmp/ollama_proxy.py > /tmp/proxy.log 2>&1 &
