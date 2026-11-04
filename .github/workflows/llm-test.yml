@@ -1,104 +1,58 @@
-name: LLM Test
+name: Local LLM Test
 
 on:
   workflow_dispatch:
     inputs:
       prompt:
-        description: "Prompt to send to the LLM"
+        description: "Prompt to send to the local model"
         required: true
         type: string
-        default: "Reply with exactly: LLM connection successful."
+        default: "Explain what a large language model is in one sentence."
       model:
-        description: "Model ID (leave blank to use the LLM_MODEL repository variable)"
-        required: false
+        description: "Ollama model to run"
+        required: true
         type: string
+        default: "qwen2.5:1.5b"
 
 permissions:
   contents: read
 
 jobs:
   test-llm:
-    name: Test LLM API
+    name: Run local LLM
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
-      - name: Call LLM and verify response
+      - name: Install Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama
+        run: |
+          ollama serve > /tmp/ollama.log 2>&1 &
+          for i in {1..30}; do
+            if curl --silent --fail http://localhost:11434/api/tags > /dev/null; then
+              echo "Ollama is ready."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Ollama did not start."
+          cat /tmp/ollama.log
+          exit 1
+
+      - name: Download model
         env:
-          LLM_API_URL: ${{ vars.LLM_API_URL }}
-          LLM_MODEL: ${{ inputs.model || vars.LLM_MODEL }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          MODEL: ${{ inputs.model }}
+        run: |
+          echo "Downloading $MODEL..."
+          ollama pull "$MODEL"
+
+      - name: Run prompt
+        env:
+          MODEL: ${{ inputs.model }}
           PROMPT: ${{ inputs.prompt }}
         run: |
-          python - <<'PY'
-          import json
-          import os
-          import sys
-          import urllib.error
-          import urllib.request
-
-          api_url = os.environ.get("LLM_API_URL", "").strip()
-          model = os.environ.get("LLM_MODEL", "").strip()
-          api_key = os.environ.get("LLM_API_KEY", "")
-          prompt = os.environ.get("PROMPT", "").strip()
-
-          missing = [
-              name for name, value in (
-                  ("LLM_API_URL repository variable", api_url),
-                  ("LLM_MODEL repository variable or workflow input", model),
-                  ("LLM_API_KEY repository secret", api_key),
-                  ("prompt", prompt),
-              ) if not value
-          ]
-          if missing:
-              print("::error::Missing configuration: " + ", ".join(missing))
-              sys.exit(1)
-
-          payload = {
-              "model": model,
-              "messages": [{"role": "user", "content": prompt}],
-              "temperature": 0.2,
-          }
-          request = urllib.request.Request(
-              api_url,
-              data=json.dumps(payload).encode("utf-8"),
-              headers={
-                  "Authorization": f"Bearer {api_key}",
-                  "Content-Type": "application/json",
-                  "Accept": "application/json",
-              },
-              method="POST",
-          )
-
-          print(f"Testing model: {model}")
-          print(f"API endpoint: {api_url}")
-          try:
-              with urllib.request.urlopen(request, timeout=90) as response:
-                  result = json.loads(response.read().decode("utf-8"))
-          except urllib.error.HTTPError as error:
-              detail = error.read().decode("utf-8", errors="replace")
-              print(f"::error::LLM API returned HTTP {error.code}: {detail[:1500]}")
-              sys.exit(1)
-          except Exception as error:
-              print(f"::error::LLM request failed: {error}")
-              sys.exit(1)
-
-          try:
-              answer = result["choices"][0]["message"]["content"]
-          except (KeyError, IndexError, TypeError):
-              print("::error::Unexpected response format; expected an OpenAI-compatible chat completions response.")
-              print(json.dumps(result, indent=2)[:3000])
-              sys.exit(1)
-
-          if isinstance(answer, list):
-              answer = "\n".join(
-                  item.get("text", "") for item in answer
-                  if isinstance(item, dict)
-              )
-          if not isinstance(answer, str) or not answer.strip():
-              print("::error::The model returned an empty response.")
-              sys.exit(1)
-
-          print("\n--- Model response ---")
-          print(answer)
-          print("\n::notice::LLM API test passed.")
-          PY
+          echo "Running $MODEL locally on the GitHub Actions runner..."
+          echo ""
+          ollama run "$MODEL" "$PROMPT"
