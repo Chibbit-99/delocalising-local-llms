@@ -1,14 +1,23 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="0;url=https://spam-preparation-deer-coaching.trycloudflare.com">
-  <title>Local Ollama API</title>
-  <script>window.location.replace("https://spam-preparation-deer-coaching.trycloudflare.com");</script>
-</head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#101114">
+<title>Local LLM</title>
+<style>
+:root{color-scheme:dark;font-family:Inter,system-ui,sans-serif;background:#101114;color:#eee}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;flex-direction:column}
+header{height:62px;border-bottom:1px solid #292a30;display:flex;align-items:center;padding:0 max(20px,calc((100vw - 850px)/2));gap:12px}.dot{width:9px;height:9px;border-radius:50%;background:#72d69a}header strong{font-size:15px;font-weight:600}#status{margin-left:auto;color:#92939c;font-size:12px}
+main{width:min(850px,100%);margin:0 auto;flex:1;display:flex;flex-direction:column;padding:28px 20px 18px}#messages{flex:1;display:flex;flex-direction:column;gap:18px;padding:12px 0 28px}.welcome{margin:auto;text-align:center;color:#a3a4ad}.welcome h1{color:#f4f4f5;font-size:25px;font-weight:600;letter-spacing:-.7px}.welcome p{font-size:14px}
+.message{max-width:85%;padding:13px 16px;border-radius:15px;font-size:14px;line-height:1.65;white-space:pre-wrap;overflow-wrap:anywhere}.user{align-self:flex-end;background:#292b32}.assistant{align-self:flex-start;background:#1b1c21;border:1px solid #2a2b31}
+form{display:flex;gap:10px;padding:10px;border:1px solid #35363e;border-radius:17px;background:#191a1f}textarea{flex:1;resize:none;max-height:180px;min-height:42px;border:0;outline:0;background:transparent;color:#f5f5f5;font:14px/1.5 system-ui;padding:11px}button{align-self:flex-end;border:0;border-radius:11px;background:#eee;color:#151515;font-weight:600;padding:11px 16px;cursor:pointer}button:disabled{opacity:.4;cursor:default}.hint{text-align:center;color:#777982;font-size:11px;padding:10px 0 0}
+</style></head>
 <body>
-  <p>Redirecting to the currently hosted Ollama API...</p>
-  <p><a href="https://spam-preparation-deer-coaching.trycloudflare.com">https://spam-preparation-deer-coaching.trycloudflare.com</a></p>
-</body>
-</html>
+<header><span class="dot"></span><strong>Local LLM</strong><span id="status">Connecting…</span></header>
+<main><section id="messages"><div class="welcome" id="welcome"><h1>What are we thinking about?</h1><p>Chat with a locally hosted Ollama model.</p></div></section>
+<form id="chat"><textarea id="prompt" rows="1" placeholder="Message the model…" required></textarea><button id="send" type="submit">Send</button></form><div class="hint">Enter to send · Shift + Enter for a new line</div></main>
+<script>
+const API_BASE="";const MODEL="";const messages=document.querySelector("#messages"),form=document.querySelector("#chat"),promptBox=document.querySelector("#prompt"),send=document.querySelector("#send"),status=document.querySelector("#status");const history=[];
+async function checkApi(){try{const r=await fetch(API_BASE+"/api/tags");if(!r.ok)throw Error("HTTP "+r.status);status.textContent="Online · "+MODEL}catch(e){status.textContent="API unavailable"}}
+function addMessage(role,text){document.querySelector("#welcome")?.remove();const el=document.createElement("div");el.className="message "+role;el.textContent=text;messages.appendChild(el);el.scrollIntoView({behavior:"smooth",block:"end"});return el}
+form.addEventListener("submit",async e=>{e.preventDefault();const text=promptBox.value.trim();if(!text||send.disabled)return;promptBox.value="";addMessage("user",text);history.push({role:"user",content:text});const reply=addMessage("assistant","Thinking…");send.disabled=true;try{const r=await fetch(API_BASE+"/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:MODEL,messages:history,stream:false})});if(!r.ok)throw Error(await r.text());const data=await r.json();const answer=data.message?.content||"(Empty response)";reply.textContent=answer;history.push({role:"assistant",content:answer});status.textContent="Online · "+MODEL}catch(err){reply.textContent="Request failed: "+err.message;status.textContent="Connection error";history.pop()}finally{send.disabled=false;promptBox.focus()}});
+promptBox.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();form.requestSubmit()}});checkApi();
+</script></body></html>
