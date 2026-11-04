@@ -1,58 +1,189 @@
-name: Local LLM Test
+name: Local Ollama API
 
 on:
   workflow_dispatch:
     inputs:
-      prompt:
-        description: "Prompt to send to the local model"
-        required: true
-        type: string
-        default: "Explain what a large language model is in one sentence."
       model:
-        description: "Ollama model to run"
+        description: "Ollama model to serve"
         required: true
         type: string
         default: "qwen2.5:1.5b"
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: local-ollama-api
+  cancel-in-progress: true
 
 jobs:
-  test-llm:
-    name: Run local LLM
+  serve:
+    name: Host local Ollama API
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 360
     steps:
-      - name: Install Ollama
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Install Ollama and cloudflared
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/cloudflared
 
-      - name: Start Ollama
+      - name: Start Ollama and download model
+        env:
+          MODEL: ${{ inputs.model }}
         run: |
           ollama serve > /tmp/ollama.log 2>&1 &
-          for i in {1..30}; do
-            if curl --silent --fail http://localhost:11434/api/tags > /dev/null; then
-              echo "Ollama is ready."
-              exit 0
+          for i in {1..60}; do
+            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then
+              break
             fi
             sleep 2
           done
-          echo "::error::Ollama did not start."
-          cat /tmp/ollama.log
-          exit 1
-
-      - name: Download model
-        env:
-          MODEL: ${{ inputs.model }}
-        run: |
-          echo "Downloading $MODEL..."
+          curl -fsS http://127.0.0.1:11434/api/tags >/dev/null || {
+            cat /tmp/ollama.log
+            echo "::error::Ollama failed to start."
+            exit 1
+          }
           ollama pull "$MODEL"
 
-      - name: Run prompt
-        env:
-          MODEL: ${{ inputs.model }}
-          PROMPT: ${{ inputs.prompt }}
+      - name: Start activity-tracked API proxy
         run: |
-          echo "Running $MODEL locally on the GitHub Actions runner..."
-          echo ""
-          ollama run "$MODEL" "$PROMPT"
+          cat > /tmp/ollama_proxy.py <<'PY'
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from urllib.request import Request, urlopen
+          from urllib.error import HTTPError, URLError
+          import os
+
+          ACTIVITY = "/tmp/ollama-last-request"
+
+          class Proxy(BaseHTTPRequestHandler):
+              protocol_version = "HTTP/1.1"
+
+              def do_GET(self): self.forward()
+              def do_POST(self): self.forward()
+              def do_DELETE(self): self.forward()
+              def do_HEAD(self): self.forward()
+
+              def forward(self):
+                  open(ACTIVITY, "a").close()
+                  length = int(self.headers.get("Content-Length", "0"))
+                  body = self.rfile.read(length) if length else None
+                  headers = {
+                      k: v for k, v in self.headers.items()
+                      if k.lower() not in ("host", "connection", "content-length")
+                  }
+                  req = Request(
+                      "http://127.0.0.1:11434" + self.path,
+                      data=body,
+                      headers=headers,
+                      method=self.command
+                  )
+                  try:
+                      with urlopen(req, timeout=600) as response:
+                          data = response.read()
+                          self.send_response(response.status)
+                          for key, value in response.headers.items():
+                              if key.lower() not in ("transfer-encoding", "connection", "content-length"):
+                                  self.send_header(key, value)
+                          self.send_header("Content-Length", str(len(data)))
+                          self.end_headers()
+                          if self.command != "HEAD":
+                              self.wfile.write(data)
+                  except HTTPError as error:
+                      data = error.read()
+                      self.send_response(error.code)
+                      self.send_header("Content-Type", error.headers.get("Content-Type", "application/json"))
+                      self.send_header("Content-Length", str(len(data)))
+                      self.end_headers()
+                      self.wfile.write(data)
+                  except (URLError, TimeoutError, OSError) as error:
+                      data = ("Upstream Ollama error: " + str(error)).encode()
+                      self.send_response(502)
+                      self.send_header("Content-Type", "text/plain; charset=utf-8")
+                      self.send_header("Content-Length", str(len(data)))
+                      self.end_headers()
+                      self.wfile.write(data)
+
+              def log_message(self, fmt, *args):
+                  print(fmt % args, flush=True)
+
+          open(ACTIVITY, "a").close()
+          ThreadingHTTPServer(("127.0.0.1", 8000), Proxy).serve_forever()
+          PY
+          python /tmp/ollama_proxy.py > /tmp/proxy.log 2>&1 &
+          echo $! > /tmp/proxy.pid
+          for i in {1..20}; do
+            if curl -fsS http://127.0.0.1:8000/api/tags >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8000/api/tags >/dev/null
+
+      - name: Start Cloudflare Quick Tunnel
+        run: |
+          cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate --logfile /tmp/cloudflared.log >/tmp/cloudflared-stdout.log 2>&1 &
+          echo $! > /tmp/cloudflared.pid
+          for i in {1..60}; do
+            URL=$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log /tmp/cloudflared-stdout.log 2>/dev/null | head -n 1 | sed 's/^[^:]*://')
+            if [ -n "$URL" ]; then
+              echo "OLLAMA_PUBLIC_URL=$URL" >> "$GITHUB_ENV"
+              echo "Tunnel ready: $URL"
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "${URL:-}" ]; then
+            cat /tmp/cloudflared.log /tmp/cloudflared-stdout.log
+            echo "::error::Could not obtain a Cloudflare tunnel URL."
+            exit 1
+          fi
+
+      - name: Update root redirect page
+        run: |
+          cat > index.html <<EOF
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <meta http-equiv="refresh" content="0;url=$OLLAMA_PUBLIC_URL">
+            <title>Local Ollama API</title>
+            <script>window.location.replace("$OLLAMA_PUBLIC_URL");</script>
+          </head>
+          <body>
+            <p>Redirecting to the currently hosted Ollama API...</p>
+            <p><a href="$OLLAMA_PUBLIC_URL">$OLLAMA_PUBLIC_URL</a></p>
+          </body>
+          </html>
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          if ! git diff --cached --quiet; then
+            git commit -m "Update live Ollama tunnel URL"
+            git push
+          fi
+          echo "The root index.html now redirects to the active tunnel."
+
+      - name: Keep API alive until 5 minutes of inactivity
+        run: |
+          echo "API endpoint: $OLLAMA_PUBLIC_URL"
+          echo "Ollama API is available at $OLLAMA_PUBLIC_URL"
+          echo "The runner will shut down after 5 minutes without a request."
+          while true; do
+            NOW=$(date +%s)
+            LAST=$(stat -c %Y /tmp/ollama-last-request)
+            IDLE=$((NOW - LAST))
+            if [ "$IDLE" -ge 300 ]; then
+              echo "No API requests for 5 minutes. Shutting down."
+              break
+            fi
+            sleep 5
+          done
