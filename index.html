@@ -15,7 +15,7 @@ form{display:flex;gap:10px;padding:10px;border:1px solid #35363e;border-radius:1
 <main><section id="messages"><div class="welcome" id="welcome"><h1>What are we thinking about?</h1><p>Chat with a locally hosted Ollama model.</p></div></section>
 <form id="chat"><textarea id="prompt" rows="1" placeholder="Message the model…" required></textarea><button id="send" type="submit">Send</button></form><div class="hint">Enter to send · Shift + Enter for a new line</div></main>
 <script>
-const API_BASE="https://hills-handy-screensaver-behavioral.trycloudflare.com";const MODEL="qwen2.5:1.5b";const messages=document.querySelector("#messages"),form=document.querySelector("#chat"),promptBox=document.querySelector("#prompt"),send=document.querySelector("#send"),status=document.querySelector("#status");const history=[];
+const API_BASE="https://sell-distributed-branches-arkansas.trycloudflare.com";const MODEL="qwen2.5:1.5b";const messages=document.querySelector("#messages"),form=document.querySelector("#chat"),promptBox=document.querySelector("#prompt"),send=document.querySelector("#send"),status=document.querySelector("#status");const history=[];
 async function checkApi(){try{const r=await fetch(API_BASE+"/api/tags");if(!r.ok)throw Error("HTTP "+r.status);status.textContent="Online · "+MODEL}catch(e){status.textContent="API unavailable"}}
 function addMessage(role,text){document.querySelector("#welcome")?.remove();const el=document.createElement("div");el.className="message "+role;el.textContent=text;messages.appendChild(el);el.scrollIntoView({behavior:"smooth",block:"end"});return el}
 form.addEventListener("submit", async e => {
