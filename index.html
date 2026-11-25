@@ -18,7 +18,64 @@ form{display:flex;gap:10px;padding:10px;border:1px solid #35363e;border-radius:1
 const API_BASE="https://hills-handy-screensaver-behavioral.trycloudflare.com";const MODEL="qwen2.5:1.5b";const messages=document.querySelector("#messages"),form=document.querySelector("#chat"),promptBox=document.querySelector("#prompt"),send=document.querySelector("#send"),status=document.querySelector("#status");const history=[];
 async function checkApi(){try{const r=await fetch(API_BASE+"/api/tags");if(!r.ok)throw Error("HTTP "+r.status);status.textContent="Online · "+MODEL}catch(e){status.textContent="API unavailable"}}
 function addMessage(role,text){document.querySelector("#welcome")?.remove();const el=document.createElement("div");el.className="message "+role;el.textContent=text;messages.appendChild(el);el.scrollIntoView({behavior:"smooth",block:"end"});return el}
-form.addEventListener("submit",async e=>{e.preventDefault();const text=promptBox.value.trim();if(!text||send.disabled)return;promptBox.value="";addMessage("user",text);history.push({role:"user",content:text});const reply=addMessage("assistant","Thinking…");send.disabled=true;try{const r=await fetch(API_BASE+"/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:MODEL,messages:history,stream:false})});if(!r.ok)throw Error(await r.text());const data=await r.json();const answer=data.message?.content||"(Empty response)";reply.textContent=answer;history.push({role:"assistant",content:answer});status.textContent="Online · "+MODEL}catch(err){reply.textContent="Request failed: "+err.message;status.textContent="Connection error";history.pop()}finally{send.disabled=false;promptBox.focus()}});
+form.addEventListener("submit", async e => {
+  e.preventDefault();
+  const text = promptBox.value.trim();
+  if (!text || send.disabled) return;
+  promptBox.value = "";
+  addMessage("user", text);
+  history.push({role: "user", content: text});
+  const reply = addMessage("assistant", "Thinking…");
+  send.disabled = true;
+  let answer = "";
+  let reader;
+  try {
+    const r = await fetch(API_BASE + "/api/chat", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({model: MODEL, messages: history, stream: true})
+    });
+    if (!r.ok) throw Error(await r.text());
+    if (!r.body) throw Error("Streaming is not supported by this browser");
+    reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let completed = false;
+    function handleLine(line) {
+      if (!line.trim()) return;
+      const data = JSON.parse(line);
+      if (data.error) throw Error(data.error);
+      if (data.message?.content) {
+        answer += data.message.content;
+        reply.textContent = answer;
+        reply.scrollIntoView({behavior: "smooth", block: "end"});
+      }
+      if (data.done === true) completed = true;
+    }
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      const lines = buffer.split("\n");
+      buffer = lines.pop();
+      for (const line of lines) handleLine(line);
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) handleLine(buffer);
+    if (!completed) throw Error("Response ended before generation completed");
+    reply.textContent = answer || "(Empty response)";
+    history.push({role: "assistant", content: answer || "(Empty response)"});
+    status.textContent = "Online · " + MODEL;
+  } catch (err) {
+    if (reader) await reader.cancel().catch(() => {});
+    reply.textContent = (answer ? answer + "\n\n" : "") + "Request failed: " + err.message;
+    status.textContent = "Connection error";
+    history.pop();
+  } finally {
+    send.disabled = false;
+    promptBox.focus();
+  }
+});
 promptBox.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();form.requestSubmit()}});checkApi();
 </script></body></html>
 

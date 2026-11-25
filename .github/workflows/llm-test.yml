@@ -21,23 +21,78 @@ jobs:
     name: Host local Ollama API
     runs-on: ubuntu-latest
     timeout-minutes: 360
+    env:
+      # Bump these versions to refresh the corresponding tool caches.
+      OLLAMA_VERSION: v0.40.18
+      CLOUDFLARED_VERSION: 2026.11.2
+      OLLAMA_KEEP_ALIVE: "-1"
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
           persist-credentials: true
 
-      - name: Install Ollama and cloudflared
-        run: |
-          curl -fsSL https://ollama.com/install.sh | sh
-          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
-          chmod +x cloudflared
-          sudo mv cloudflared /usr/local/bin/cloudflared
+      - name: Configure model storage
+        run: echo "OLLAMA_MODELS=$RUNNER_TEMP/ollama-models" >> "$GITHUB_ENV"
 
-      - name: Start Ollama and download model
+      - name: Calculate model cache key
+        id: model-key
         env:
           MODEL: ${{ inputs.model }}
         run: |
+          # Hash the complete model name so tags and registry paths are safe in cache keys.
+          printf 'hash=%s\n' "$(printf '%s' "$MODEL" | sha256sum | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Ollama
+        id: ollama-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ollama
+          key: ollama-linux-amd64-cpu-v1-${{ env.OLLAMA_VERSION }}
+
+      - name: Restore cloudflared
+        id: cloudflared-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/cloudflared
+          key: cloudflared-linux-amd64-v1-${{ env.CLOUDFLARED_VERSION }}
+
+      - name: Restore model weights
+        id: model-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/ollama-models
+          key: ollama-models-linux-amd64-v1-${{ steps.model-key.outputs.hash }}
+
+      - name: Install missing tools
+        run: |
+          set -euo pipefail
+          if [ ! -x "$RUNNER_TEMP/ollama/bin/ollama" ]; then
+            mkdir -p "$RUNNER_TEMP/ollama"
+            if ! command -v zstd >/dev/null; then
+              sudo apt-get update
+              sudo apt-get install -y zstd
+            fi
+            # GitHub-hosted runners use CPUs. Skip GPU libraries to keep the cache smaller.
+            curl -fL --retry 3 "https://github.com/ollama/ollama/releases/download/${OLLAMA_VERSION}/ollama-linux-amd64.tar.zst" | \
+              tar --zstd -xf - -C "$RUNNER_TEMP/ollama" \
+                --exclude='lib/ollama/cuda*' --exclude='./lib/ollama/cuda*' \
+                --exclude='lib/ollama/rocm*' --exclude='./lib/ollama/rocm*' \
+                --exclude='lib/ollama/vulkan*' --exclude='./lib/ollama/vulkan*'
+          fi
+          if [ ! -x "$RUNNER_TEMP/cloudflared/cloudflared" ]; then
+            mkdir -p "$RUNNER_TEMP/cloudflared"
+            curl -fL --retry 3 "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64" -o "$RUNNER_TEMP/cloudflared/cloudflared"
+            chmod +x "$RUNNER_TEMP/cloudflared/cloudflared"
+          fi
+          echo "$RUNNER_TEMP/ollama/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/cloudflared" >> "$GITHUB_PATH"
+
+      - name: Start Ollama and prepare model
+        env:
+          MODEL: ${{ inputs.model }}
+        run: |
+          set -euo pipefail
           ollama serve > /tmp/ollama.log 2>&1 &
           for i in {1..60}; do
             if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then
@@ -50,55 +105,124 @@ jobs:
             echo "::error::Ollama failed to start."
             exit 1
           }
-          ollama pull "$MODEL"
+          if ollama show "$MODEL" >/dev/null 2>&1; then
+            echo "Using cached model: $MODEL"
+          else
+            echo "Model not cached; downloading: $MODEL"
+            ollama pull "$MODEL"
+          fi
+
+          # Load the weights and perform a real, minimal generation before publishing
+          # the endpoint. Keep the model resident for the lifetime of the server.
+          jq -n --arg model "$MODEL" \
+            '{model: $model, prompt: "Hello", stream: false, keep_alive: -1, options: {num_predict: 1}}' > /tmp/ollama-warmup-request.json
+          if ! curl -fsS --max-time 900 -H 'Content-Type: application/json' \
+            --data-binary @/tmp/ollama-warmup-request.json \
+            http://127.0.0.1:11434/api/generate > /tmp/ollama-warmup-response.json || \
+            ! jq -e '.done == true and (.error | not)' /tmp/ollama-warmup-response.json >/dev/null; then
+            cat /tmp/ollama-warmup-response.json /tmp/ollama.log
+            echo "::error::Model warm-up failed."
+            exit 1
+          fi
+          echo "Model warmed and ready: $MODEL"
 
       - name: Start activity-tracked API proxy
         run: |
           cat > /tmp/ollama_proxy.py <<'PY'
           from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from http.client import HTTPException
           from urllib.request import Request, urlopen
           from urllib.error import HTTPError, URLError
           import os, threading
+
           ACTIVITY = "/tmp/ollama-last-request"
+          HOP_HEADERS = {"transfer-encoding", "connection", "content-length", "keep-alive",
+                         "proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade"}
+
           class Proxy(BaseHTTPRequestHandler):
               protocol_version = "HTTP/1.1"
+
               def cors(self):
                   self.send_header("Access-Control-Allow-Origin", "*")
                   self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
                   self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
               def do_OPTIONS(self):
-                  os.utime(ACTIVITY, None); self.send_response(204); self.cors()
-                  self.send_header("Content-Length","0"); self.end_headers()
+                  os.utime(ACTIVITY, None)
+                  self.send_response(204)
+                  self.cors()
+                  self.send_header("Content-Length", "0")
+                  self.end_headers()
+
               def do_GET(self): self.forward()
               def do_POST(self): self.forward()
               def do_DELETE(self): self.forward()
+
               def forward(self):
-                  os.utime(ACTIVITY,None); done=threading.Event()
+                  os.utime(ACTIVITY, None)
+                  done = threading.Event()
                   def beat():
-                      while not done.wait(20): os.utime(ACTIVITY,None)
-                  threading.Thread(target=beat,daemon=True).start()
+                      while not done.wait(20): os.utime(ACTIVITY, None)
+                  threading.Thread(target=beat, daemon=True).start()
                   try:
-                      n=int(self.headers.get("Content-Length","0")); body=self.rfile.read(n) if n else None
-                      headers={k:v for k,v in self.headers.items() if k.lower() not in ("host","connection","content-length","origin")}
-                      req=Request("http://127.0.0.1:11434"+self.path,data=body,headers=headers,method=self.command)
+                      n = int(self.headers.get("Content-Length", "0"))
+                      body = self.rfile.read(n) if n else None
+                      headers = {k: v for k, v in self.headers.items()
+                                 if k.lower() not in HOP_HEADERS | {"host", "origin"}}
+                      req = Request("http://127.0.0.1:11434" + self.path, data=body,
+                                    headers=headers, method=self.command)
                       try:
-                          with urlopen(req,timeout=600) as res:
-                              data=res.read(); self.send_response(res.status)
-                              for k,v in res.headers.items():
-                                  if k.lower() not in ("transfer-encoding","connection","content-length","access-control-allow-origin"): self.send_header(k,v)
-                              self.cors(); self.send_header("Content-Length",str(len(data))); self.end_headers()
-                              if self.command!="HEAD": self.wfile.write(data)
+                          res = urlopen(req, timeout=600)
                       except HTTPError as e:
-                          data=e.read(); self.send_response(e.code); self.send_header("Content-Type",e.headers.get("Content-Type","application/json"))
-                          self.cors(); self.send_header("Content-Length",str(len(data))); self.end_headers(); self.wfile.write(data)
-                      except (URLError,TimeoutError,OSError) as e:
-                          data=("Ollama upstream error: "+str(e)).encode(); self.send_response(502)
-                          self.send_header("Content-Type","text/plain"); self.cors(); self.send_header("Content-Length",str(len(data)))
-                          self.end_headers(); self.wfile.write(data)
-                  finally: done.set(); os.utime(ACTIVITY,None)
-              def log_message(self,fmt,*args): print(fmt%args,flush=True)
-          open(ACTIVITY,"a").close(); os.utime(ACTIVITY,None)
-          ThreadingHTTPServer(("127.0.0.1",8000),Proxy).serve_forever()
+                          # HTTPError is also a response; forward its status and body.
+                          res = e
+                      except (URLError, TimeoutError, OSError) as e:
+                          data = ("Ollama upstream error: " + str(e)).encode()
+                          self.send_response(502)
+                          self.send_header("Content-Type", "text/plain")
+                          self.cors()
+                          self.send_header("Content-Length", str(len(data)))
+                          self.end_headers()
+                          self.wfile.write(data)
+                          return
+
+                      with res:
+                          self.send_response(res.status)
+                          for k, v in res.headers.items():
+                              if k.lower() not in HOP_HEADERS and not k.lower().startswith("access-control-"):
+                                  self.send_header(k, v)
+                          self.cors()
+                          no_body = res.status in (204, 304) or 100 <= res.status < 200
+                          if not no_body:
+                              # urllib decodes upstream chunking. Reframe as chunked HTTP/1.1
+                              # so the client can consume data without waiting for EOF.
+                              self.send_header("Transfer-Encoding", "chunked")
+                          self.end_headers()
+                          if no_body:
+                              return
+                          try:
+                              while True:
+                                  chunk = res.read1(65536)
+                                  if not chunk:
+                                      break
+                                  self.wfile.write(f"{len(chunk):X}\r\n".encode() + chunk + b"\r\n")
+                                  self.wfile.flush()
+                              self.wfile.write(b"0\r\n\r\n")
+                              self.wfile.flush()
+                          except (OSError, TimeoutError, HTTPException) as e:
+                              # Headers are already sent: close rather than emitting a second
+                              # response or a terminating chunk for a truncated stream.
+                              self.close_connection = True
+                              self.log_error("Streaming failed: %s", e)
+                  finally:
+                      done.set()
+                      os.utime(ACTIVITY, None)
+
+              def log_message(self, fmt, *args): print(fmt % args, flush=True)
+
+          open(ACTIVITY, "a").close()
+          os.utime(ACTIVITY, None)
+          ThreadingHTTPServer(("127.0.0.1", 8000), Proxy).serve_forever()
           PY
           python /tmp/ollama_proxy.py >/tmp/proxy.log 2>&1 &
           for i in {1..20}; do
@@ -151,10 +275,67 @@ jobs:
           const API_BASE="__OLLAMA_API_URL__";const MODEL="__OLLAMA_MODEL__";const messages=document.querySelector("#messages"),form=document.querySelector("#chat"),promptBox=document.querySelector("#prompt"),send=document.querySelector("#send"),status=document.querySelector("#status");const history=[];
           async function checkApi(){try{const r=await fetch(API_BASE+"/api/tags");if(!r.ok)throw Error("HTTP "+r.status);status.textContent="Online · "+MODEL}catch(e){status.textContent="API unavailable"}}
           function addMessage(role,text){document.querySelector("#welcome")?.remove();const el=document.createElement("div");el.className="message "+role;el.textContent=text;messages.appendChild(el);el.scrollIntoView({behavior:"smooth",block:"end"});return el}
-          form.addEventListener("submit",async e=>{e.preventDefault();const text=promptBox.value.trim();if(!text||send.disabled)return;promptBox.value="";addMessage("user",text);history.push({role:"user",content:text});const reply=addMessage("assistant","Thinking…");send.disabled=true;try{const r=await fetch(API_BASE+"/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model:MODEL,messages:history,stream:false})});if(!r.ok)throw Error(await r.text());const data=await r.json();const answer=data.message?.content||"(Empty response)";reply.textContent=answer;history.push({role:"assistant",content:answer});status.textContent="Online · "+MODEL}catch(err){reply.textContent="Request failed: "+err.message;status.textContent="Connection error";history.pop()}finally{send.disabled=false;promptBox.focus()}});
+          form.addEventListener("submit", async e => {
+            e.preventDefault();
+            const text = promptBox.value.trim();
+            if (!text || send.disabled) return;
+            promptBox.value = "";
+            addMessage("user", text);
+            history.push({role: "user", content: text});
+            const reply = addMessage("assistant", "Thinking…");
+            send.disabled = true;
+            let answer = "";
+            let reader;
+            try {
+              const r = await fetch(API_BASE + "/api/chat", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({model: MODEL, messages: history, stream: true})
+              });
+              if (!r.ok) throw Error(await r.text());
+              if (!r.body) throw Error("Streaming is not supported by this browser");
+              reader = r.body.getReader();
+              const decoder = new TextDecoder();
+              let buffer = "";
+              let completed = false;
+              function handleLine(line) {
+                if (!line.trim()) return;
+                const data = JSON.parse(line);
+                if (data.error) throw Error(data.error);
+                if (data.message?.content) {
+                  answer += data.message.content;
+                  reply.textContent = answer;
+                  reply.scrollIntoView({behavior: "smooth", block: "end"});
+                }
+                if (data.done === true) completed = true;
+              }
+              while (true) {
+                const {value, done} = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, {stream: true});
+                const lines = buffer.split("\n");
+                buffer = lines.pop();
+                for (const line of lines) handleLine(line);
+              }
+              buffer += decoder.decode();
+              if (buffer.trim()) handleLine(buffer);
+              if (!completed) throw Error("Response ended before generation completed");
+              reply.textContent = answer || "(Empty response)";
+              history.push({role: "assistant", content: answer || "(Empty response)"});
+              status.textContent = "Online · " + MODEL;
+            } catch (err) {
+              if (reader) await reader.cancel().catch(() => {});
+              reply.textContent = (answer ? answer + "\n\n" : "") + "Request failed: " + err.message;
+              status.textContent = "Connection error";
+              history.pop();
+            } finally {
+              send.disabled = false;
+              promptBox.focus();
+            }
+          });
           promptBox.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();form.requestSubmit()}});checkApi();
           </script></body></html>
-          
+
           HTML
           sed -i "s|__OLLAMA_API_URL__|$OLLAMA_PUBLIC_URL|g" index.html
           sed -i "s|__OLLAMA_MODEL__|$MODEL|g" index.html
@@ -166,6 +347,32 @@ jobs:
             git push
           fi
           echo "Chat frontend configured for $OLLAMA_PUBLIC_URL"
+
+      # Save explicitly, rather than in a post-job hook: the serving job may run
+      # for hours or be cancelled by the next dispatch. The endpoint is already live.
+      - name: Save Ollama cache
+        if: steps.ollama-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ollama
+          key: ollama-linux-amd64-cpu-v1-${{ env.OLLAMA_VERSION }}
+
+      - name: Save cloudflared cache
+        if: steps.cloudflared-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/cloudflared
+          key: cloudflared-linux-amd64-v1-${{ env.CLOUDFLARED_VERSION }}
+
+      - name: Save model weights cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/ollama-models
+          key: ollama-models-linux-amd64-v1-${{ steps.model-key.outputs.hash }}
 
       - name: Keep API alive until 5 minutes of inactivity
         run: |
